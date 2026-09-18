@@ -5,6 +5,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -87,7 +89,58 @@ func TestExtract(t *testing.T) {
 	}
 }
 
-// Corruption is only caught because the unpackers read to the end of the stream.
+func TestExtractSkipsSymlinks(t *testing.T) {
+	const binary = "\x7fELF not really, but distinctive enough"
+
+	var tarred bytes.Buffer
+	tw := tar.NewWriter(&tarred)
+	if err := tw.WriteHeader(&tar.Header{Name: "tool-1.2.3/tool", Typeflag: tar.TypeSymlink, Linkname: "../tool"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "tool", Typeflag: tar.TypeReg, Mode: 0o755, Size: int64(len(binary))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(tw, binary); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var zipped bytes.Buffer
+	zw := zip.NewWriter(&zipped)
+	link := &zip.FileHeader{Name: "tool-1.2.3/tool"}
+	link.SetMode(fs.ModeSymlink | 0o777)
+	w, err := zw.CreateHeader(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, "../tool"); err != nil {
+		t.Fatal(err)
+	}
+	if w, err = zw.Create("tool"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, binary); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for asset, packed := range map[string][]byte{"tool.tar": tarred.Bytes(), "tool.zip": zipped.Bytes()} {
+		t.Run(asset, func(t *testing.T) {
+			got, err := unpack(t, asset, FormatAuto, packed, "tool-1.2.3/tool", "tool")
+			if err != nil {
+				t.Fatalf("unpack: %v", err)
+			}
+			if string(got) != binary {
+				t.Errorf("unpack returned %q, want %q", got, binary)
+			}
+		})
+	}
+}
+
 func TestExtractRejectsCorruption(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -109,29 +162,6 @@ func TestExtractRejectsCorruption(t *testing.T) {
 			}
 		})
 	}
-}
-
-func unpack(t *testing.T, name string, override Format, asset []byte, paths ...string) ([]byte, error) {
-	t.Helper()
-	dst, err := os.CreateTemp(t.TempDir(), "binary-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dst.Close()
-
-	if err := extract(name, override, bytes.NewReader(asset), paths, dst); err != nil {
-		return nil, err
-	}
-	return os.ReadFile(dst.Name())
-}
-
-func fixture(t *testing.T, name string) []byte {
-	t.Helper()
-	data, err := os.ReadFile(filepath.Join("testdata", name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return data
 }
 
 func archive(t *testing.T, format Format, files fstest.MapFS) []byte {
@@ -176,4 +206,27 @@ func archive(t *testing.T, format Format, files fstest.MapFS) []byte {
 		t.Fatal(err)
 	}
 	return gz.Bytes()
+}
+
+func fixture(t *testing.T, name string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func unpack(t *testing.T, name string, override Format, asset []byte, paths ...string) ([]byte, error) {
+	t.Helper()
+	dst, err := os.CreateTemp(t.TempDir(), "binary-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+
+	if err := extract(name, override, bytes.NewReader(asset), paths, dst); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(dst.Name())
 }

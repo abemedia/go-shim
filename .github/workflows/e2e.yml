@@ -1,0 +1,65 @@
+name: E2E
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: 17 5 * * *
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: E2E (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: testdata/e2e
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ github.event_name == 'schedule' && 'stable' || '' }}
+          go-version-file: ${{ github.event_name != 'schedule' && 'go.mod' || '' }}
+          cache: false
+
+      - name: Test go tool
+        run: |
+          go tool stagelint --version 2>&1 | tee out
+          [[ $(<out) == *downloading*'stagelint 0.2.0' ]] || exit 1
+          go tool stagelint --version 2>&1 | tee out
+          [[ $(<out) == 'stagelint 0.2.0' ]] || exit 1
+          go clean -cache
+
+      - name: Test go run
+        run: |
+          go run . --version 2>&1 | tee out
+          [[ $(<out) == *downloading*'stagelint 0.2.0' ]] || exit 1
+          go run . --version 2>&1 | tee out
+          [[ $(<out) == 'stagelint 0.2.0' ]] || exit 1
+          go clean -cache
+
+      - name: Test go install
+        run: |
+          go install .
+          stagelint --version 2>&1 | tee out
+          [[ $(<out) == *downloading*'stagelint 0.2.0' ]] || exit 1
+          stagelint --version 2>&1 | tee out
+          [[ $(<out) == 'stagelint 0.2.0' ]] || exit 1
+
+      - name: Check the old binary is removed
+        if: runner.os == 'Windows'
+        run: |
+          bin=$(dirname "$(command -v stagelint)")
+          for _ in {1..10}; do [[ -e $bin/stagelint.exe.old ]] || break; sleep 1; done
+          [[ ! -e $bin/stagelint.exe.old ]] || exit 1

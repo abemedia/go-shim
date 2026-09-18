@@ -1,18 +1,91 @@
 package shim
 
 import (
+	"bytes"
 	"context"
+	"encoding/pem"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
+func TestRun(t *testing.T) {
+	dir := t.TempDir()
+	build := exec.CommandContext(t.Context(), "go", "build", "-o", dir, "./testdata/tool", "./testdata/shim")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+
+	var ext string
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	asset, err := os.ReadFile(filepath.Join(dir, "tool"+ext))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(dir, "shim"+ext)
+	shim, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var requests int
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Write(asset)
+	}))
+	defer srv.Close()
+
+	ca := filepath.Join(dir, "ca.pem")
+	cert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(ca, cert, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run twice, because on Windows the first replacement cannot remove the binary it moved aside.
+	for i := range 2 {
+		if err := os.WriteFile(exe, shim, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		cmd := exec.Command(exe, "--flag", "arg") //nolint:noctx
+		cmd.Env = append(os.Environ(), "SHIM_TEST_URL="+srv.URL+"/tool", "SHIM_TEST_CA="+ca)
+		out, err := cmd.CombinedOutput()
+
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) {
+			t.Fatalf("run %d: %v\n%s", i, err, out)
+		}
+		if exit.ExitCode() != 3 {
+			t.Errorf("run %d: exit = %d, want 3\n%s", i, exit.ExitCode(), out)
+		}
+		if want := "go-shim-test-tool [--flag arg]"; !strings.Contains(string(out), want) {
+			t.Errorf("run %d: output %q does not contain %q", i, out, want)
+		}
+		if replaced, err := os.ReadFile(exe); err != nil {
+			t.Fatal(err)
+		} else if !bytes.Equal(replaced, asset) {
+			t.Errorf("run %d: the binary was not replaced with the release", i)
+		}
+	}
+
+	if requests != 2 {
+		t.Errorf("made %d requests, want 2", requests)
+	}
+}
+
 func TestDownload(t *testing.T) {
 	tests := []struct {
 		name     string
-		serve    map[string]int // path to status; anything else is a 404
+		serve    map[string]int
 		paths    []string
 		cancel   bool
 		wantPath string
@@ -40,10 +113,17 @@ func TestDownload(t *testing.T) {
 			wantErr:  "no v1 release for",
 		},
 		{
-			name:     "forbidden is not absent",
-			serve:    map[string]int{"/denied": http.StatusForbidden},
-			paths:    []string{"/denied"},
-			wantReqs: 1,
+			name:     "forbidden falls back to a later candidate",
+			serve:    map[string]int{"/musl": http.StatusForbidden, "/gnu": http.StatusOK},
+			paths:    []string{"/musl", "/gnu"},
+			wantPath: "/gnu",
+			wantReqs: 2,
+		},
+		{
+			name:     "forbidden is reported when nothing is published",
+			serve:    map[string]int{"/musl": http.StatusForbidden},
+			paths:    []string{"/musl", "/gnu"},
+			wantReqs: 2,
 			wantErr:  "403",
 		},
 		{
@@ -70,8 +150,8 @@ func TestDownload(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			client.Transport = srv.Client().Transport
-			defer func() { client.Transport = nil }()
+			defer func(rt http.RoundTripper) { client.Transport = rt }(client.Transport)
+			client.Transport = httpsOnly{srv.Client().Transport}
 
 			ctx := context.Background()
 			if tt.cancel {
@@ -126,8 +206,8 @@ func TestDownloadRejectsPlaintext(t *testing.T) {
 	}))
 	defer redirect.Close()
 
-	client.Transport = redirect.Client().Transport
-	defer func() { client.Transport = nil }()
+	defer func(rt http.RoundTripper) { client.Transport = rt }(client.Transport)
+	client.Transport = httpsOnly{redirect.Client().Transport}
 
 	for _, tt := range []struct{ name, url string }{
 		{"plain candidate", plain.URL + "/musl"},
